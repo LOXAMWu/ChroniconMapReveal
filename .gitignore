@@ -1,0 +1,20 @@
+# build output
+build/
+*.o
+*.obj
+*.dll
+*.pdb
+*.exp
+*.lib
+
+# local tooling / backups
+tools/AuriePatcher.exe
+*.bak
+*.log
+
+# editor / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
