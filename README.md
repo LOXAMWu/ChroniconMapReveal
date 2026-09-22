@@ -1,9 +1,17 @@
 # Chronicon Map Reveal
 
+![vibe coded](https://img.shields.io/badge/vibe--coded-%F0%9F%8E%B2-ff69b4)
+
 Removes the fog of war from **Chronicon**'s map — every zone stays fully revealed,
 equivalent to the in-game item *Fin'ley's magical map* (`item_699`, "Use: Fully reveal the map").
 
 > 中文说明见 [README.zh-CN.md](README.zh-CN.md)。
+
+> 🧪 **This project is vibe coded.** The reverse engineering, the hook implementation and the
+> PowerShell tooling were all produced conversationally with an AI agent; the human contribution
+> was checking that the result actually works in game. It is functional and documented, but treat
+> the version-specific offsets (and anything not covered by
+> [docs/technical-notes.md](docs/technical-notes.md)) with the appropriate amount of suspicion.
 
 * Tested against Chronicon `Chronicon.exe` (59,400,704 bytes, SHA256 `C0036176…`), GameMaker Studio 2 **YYC x64** build.
 * Loaded by [Aurie](https://github.com/AurieFramework/Aurie); the hooks themselves are done with [MinHook](https://github.com/TsudaKageyu/minhook).

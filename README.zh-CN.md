@@ -1,7 +1,14 @@
 # Chronicon 地图全开 Mod
 
+![vibe coded](https://img.shields.io/badge/vibe--coded-%F0%9F%8E%B2-ff69b4)
+
 清除 **Chronicon** 小地图上的迷雾：地图常驻全开，效果等同于反复使用物品
 **“芬利的魔法地图”（item_699：使用 = 完全开启地图）**。
+
+> 🧪 **本项目是 Vibe coding 产物。** 逆向分析、挂钩实现与 PowerShell 脚本都是在与 AI 对话中
+> 生成并逐步调通的，人工部分只做了"进游戏能不能用"这一层验证。功能可用且有文档，
+> 但对版本相关的偏移量（以及 [docs/technical-notes.md](docs/technical-notes.md) 未覆盖的部分），
+> 请保持适当的怀疑态度。
 
 * 适用版本：本机实测的 `Chronicon.exe`（59,400,704 字节，SHA256 `C0036176…`），GameMaker Studio 2 **YYC x64** 构建。
 * 由 [Aurie](https://github.com/AurieFramework/Aurie) 加载，挂钩用 [MinHook](https://github.com/TsudaKageyu/minhook)。
