@@ -10,7 +10,9 @@
 //      (VA 0x141290B82 的 je -> 6 个 NOP), 使所有格子都被绘制。
 //      A + B 同时开启才能稳定生效 (只靠 A 时地图仍显示未探索样式)。
 //
-// 快捷键: F5 = 开关机制 A, F6 = 输出运行状态, F7 = 开关机制 B
+// 快捷键: 小键盘 1 = 开关机制 A, 小键盘 2 = 开关机制 B,
+//         小键盘 3 (或 F6) = 输出运行状态到日志, 小键盘 0 = 显示/隐藏右上角状态面板
+// 状态面板: 屏幕右上角实时显示两个机制的开启状态 (见 src/overlay.cpp)
 //
 // 所有目标函数在挂钩/改写前都会校验机器码签名, 版本不符则跳过 (不破坏游戏)。
 
@@ -21,6 +23,8 @@
 
 #include <MinHook.h>
 #include <Aurie/shared.hpp>
+
+#include "overlay.hpp"
 
 using namespace Aurie;
 
@@ -76,6 +80,131 @@ static volatile LONG64 g_SetAreaCalls = 0;
 static volatile LONG64 g_UpdateCalls = 0;
 static volatile LONG64 g_WorldGenCalls = 0;
 static volatile LONG64 g_Reveals = 0;
+
+// ------------------------------------------------------------------ hotkeys
+
+// 小键盘按键: 0 = 显示/隐藏面板, 1 = 机制 A, 2 = 机制 B, 3 = 输出状态
+enum NumpadSlot
+{
+	NUMPAD_SLOT_PANEL = 0,
+	NUMPAD_SLOT_REVEAL = 1,
+	NUMPAD_SLOT_DRAW_GATE = 2,
+	NUMPAD_SLOT_STATUS = 3,
+	NUMPAD_SLOT_COUNT = 4
+};
+
+static volatile LONG g_HotkeyPending[NUMPAD_SLOT_COUNT] = { 0, 0, 0, 0 };
+static bool g_HotkeyDown[NUMPAD_SLOT_COUNT] = { false, false, false, false };  // 只由键盘钩子线程读写
+static volatile LONG g_KeyboardHookActive = 0;
+
+static void OverlayLog(const char* message)
+{
+	DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] %s", message);
+}
+
+static bool GameIsForeground()
+{
+	HWND foreground = GetForegroundWindow();
+	if (!foreground)
+		return false;
+
+	DWORD process_id = 0;
+	GetWindowThreadProcessId(foreground, &process_id);
+	return process_id == GetCurrentProcessId();
+}
+
+// 小键盘数字键的扫描码。NumLock 关闭时这些键会变成 Insert/End/Down/PageDown,
+// 但扫描码不变、而且不带扩展位, 所以用扫描码判断可以两种状态通吃。
+static int NumpadSlotFromScanCode(const KBDLLHOOKSTRUCT& key)
+{
+	if ((key.flags & LLKHF_EXTENDED) != 0)
+		return -1;  // 带扩展位的是方向键 / 编辑键区, 不是小键盘
+
+	switch (key.scanCode)
+	{
+	case 0x52: return NUMPAD_SLOT_PANEL;      // 小键盘 0
+	case 0x4F: return NUMPAD_SLOT_REVEAL;     // 小键盘 1
+	case 0x50: return NUMPAD_SLOT_DRAW_GATE;  // 小键盘 2
+	case 0x51: return NUMPAD_SLOT_STATUS;     // 小键盘 3
+	default: return -1;
+	}
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wparam, LPARAM lparam)
+{
+	if (code == HC_ACTION)
+	{
+		const KBDLLHOOKSTRUCT& key = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(lparam);
+		const int slot = NumpadSlotFromScanCode(key);
+		if (slot >= 0)
+		{
+			if (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN)
+			{
+				if (!g_HotkeyDown[slot])  // 忽略长按产生的重复
+				{
+					g_HotkeyDown[slot] = true;
+					if (GameIsForeground())
+						InterlockedExchange(&g_HotkeyPending[slot], 1);
+				}
+			}
+			else if (wparam == WM_KEYUP || wparam == WM_SYSKEYUP)
+			{
+				g_HotkeyDown[slot] = false;
+			}
+		}
+	}
+	return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+static DWORD WINAPI KeyboardHookThread(LPVOID)
+{
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&LowLevelKeyboardProc),
+			&module))
+	{
+		module = GetModuleHandleW(nullptr);
+	}
+
+	HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, module, 0);
+	if (hook)
+		InterlockedExchange(&g_KeyboardHookActive, 1);
+
+	DbgPrintEx(
+		LOG_SEVERITY_INFO,
+		"[MapReveal] numpad hotkeys: %s",
+		hook
+			? "keyboard hook installed (works with NumLock on or off)"
+			: "hook unavailable, polling instead (needs NumLock on)"
+	);
+
+	MSG message;
+	while (GetMessageW(&message, nullptr, 0, 0) > 0)
+	{
+		TranslateMessage(&message);
+		DispatchMessageW(&message);
+	}
+
+	if (hook)
+		UnhookWindowsHookEx(hook);
+	return 0;
+}
+
+// 取一次按键事件 (取到就清掉)。钩子线程记录的优先; 钩子没装上时退回轮询 (需 NumLock 打开)。
+static bool TakeHotkey(int slot, int virtual_key)
+{
+	if (InterlockedExchange(&g_HotkeyPending[slot], 0) != 0)
+		return true;
+
+	if (InterlockedCompareExchange(&g_KeyboardHookActive, 0, 0) == 0 &&
+		(GetAsyncKeyState(virtual_key) & 0x1) != 0 &&
+		GameIsForeground())
+	{
+		return true;
+	}
+	return false;
+}
 
 // ------------------------------------------------------------------ helpers
 
@@ -150,14 +279,20 @@ static bool SetDrawGatePatch(bool enable)
 
 static void HandleHotkeys()
 {
-	if (GetAsyncKeyState(VK_F5) & 0x1)
+	// 小键盘 1: 机制 A
+	if (TakeHotkey(NUMPAD_SLOT_REVEAL, VK_NUMPAD1))
 	{
 		LONG current = InterlockedCompareExchange(&g_RevealEnabled, 1, 1);
 		InterlockedExchange(&g_RevealEnabled, current ? 0 : 1);
-		DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] reveal mechanism = %s", current ? "OFF" : "ON");
+		DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] mechanism A (explore calls) = %s", current ? "OFF" : "ON");
 	}
 
-	if (GetAsyncKeyState(VK_F6) & 0x1)
+	// 小键盘 2: 机制 B
+	if (TakeHotkey(NUMPAD_SLOT_DRAW_GATE, VK_NUMPAD2))
+		SetDrawGatePatch(InterlockedCompareExchange(&g_GatePatched, 0, 0) == 0);
+
+	// 小键盘 3 (或 F6): 输出状态到日志
+	if (TakeHotkey(NUMPAD_SLOT_STATUS, VK_NUMPAD3) || (GetAsyncKeyState(VK_F6) & 0x1))
 		DbgPrintEx(
 			LOG_SEVERITY_INFO,
 			"[MapReveal] status: ini=%lld refresh=%lld setArea=%lld update=%lld worldGen=%lld reveals=%lld gate=%d auto=%d",
@@ -166,8 +301,9 @@ static void HandleHotkeys()
 			InterlockedCompareExchange(&g_RevealEnabled, 0, 0)
 		);
 
-	if (GetAsyncKeyState(VK_F7) & 0x1)
-		SetDrawGatePatch(InterlockedCompareExchange(&g_GatePatched, 0, 0) == 0);
+	// 小键盘 0: 显示 / 隐藏状态面板
+	if (TakeHotkey(NUMPAD_SLOT_PANEL, VK_NUMPAD0))
+		mr_overlay::ToggleVisible();
 }
 
 // ------------------------------------------------------------------ detours
@@ -311,6 +447,19 @@ EXPORTED AurieStatus ModuleInitialize(
 	// 机制 B: 默认开启 (与机制 A 配合才能稳定生效)
 	SetDrawGatePatch(true);
 
-	DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] loaded. F5=reveal F6=status F7=draw-gate");
+	// 右上角状态面板
+	mr_overlay::Start(&g_RevealEnabled, &g_GatePatched, OverlayLog);
+
+	// 小键盘热键 (低层键盘钩子, 需要自己的消息循环)
+	HANDLE hotkey_thread = CreateThread(nullptr, 0, KeyboardHookThread, nullptr, 0, nullptr);
+	if (hotkey_thread)
+		CloseHandle(hotkey_thread);
+	else
+		DbgPrintEx(LOG_SEVERITY_ERROR, "[MapReveal] hotkey thread failed to start");
+
+	DbgPrintEx(
+		LOG_SEVERITY_INFO,
+		"[MapReveal] loaded. numpad 1=mechanism A numpad 2=mechanism B numpad 3=status numpad 0=panel"
+	);
 	return AURIE_SUCCESS;
 }

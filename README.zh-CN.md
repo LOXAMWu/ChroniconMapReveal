@@ -83,21 +83,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
 ---
 
-## 快捷键
+## 快捷键与状态面板
+
+两个机制的当前状态会实时显示在**游戏窗口右上角**的小面板上（绿色 `开启` / 红色 `关闭`），
+位置在游戏自带区域名牌的下方；游戏窗口不在前台时面板自动隐藏。
 
 | 按键 | 功能 |
 | --- | --- |
-| `F5` | 开关机制 A（`minimapExplore` 调用） |
-| `F6` | 输出运行状态到日志 |
-| `F7` | 开关机制 B（绘制判定补丁） |
+| `小键盘 1` | 开关机制 A（`minimapExplore` 调用） |
+| `小键盘 2` | 开关机制 B（绘制判定补丁） |
+| `小键盘 3`（或 `F6`） | 输出运行状态到日志 |
+| `小键盘 0` | 显示 / 隐藏状态面板 |
+
+小键盘按键用低层键盘钩子读取，NumLock 开或关都能用，并且只在游戏窗口处于前台时响应。
 
 日志：`<游戏目录>\aurie.log`，同时显示在 “Aurie Framework Log” 控制台窗口里。
+
+```
+[MapReveal] overlay: status panel thread running
+[MapReveal] numpad hotkeys: keyboard hook installed (works with NumLock on or off)
+[MapReveal] loaded. numpad 1=mechanism A numpad 2=mechanism B numpad 3=status numpad 0=panel
+```
 
 ---
 
 ## 说明
 
 * 单机、客户端本地生效，不影响存档格式。
+* 状态面板是一个置顶的 layered 窗口，所以需要窗口化 / 无边框全屏模式；真·独占全屏下系统不会
+  合成其他窗口，面板看不见（快捷键仍然可用）。
+* 面板尺寸随游戏窗口宽度等比缩放（参考宽度 1512 px，限幅 75%–175%），分辨率变化时观感一致；
+  用独立的 layered 窗口 + GDI 绘制，不依赖游戏的 D3D11 渲染。
 * 偏移量针对实测的那个 `Chronicon.exe` 版本；游戏更新后签名校验会失败并自动禁用，
   带上新的 exe SHA256 提 issue 即可更新地址。
 * Steam 更新或“验证游戏文件完整性”会覆盖 exe，之后重跑 `tools\install.ps1` 即可。

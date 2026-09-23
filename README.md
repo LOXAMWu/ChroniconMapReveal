@@ -91,13 +91,22 @@ The DLL is written to `build\ChroniconMapReveal.dll`. MinHook is vendored in
 
 ---
 
-## In-game keys
+## In-game keys and status panel
+
+The current state of both mechanisms is drawn in a small always-on-top panel in the
+**top-right corner of the game window** — green `开启` = on, red `关闭` = off. It sits just
+below the game's own zone-name plate and hides itself whenever the game window is not in
+the foreground.
 
 | Key | Action |
 | --- | --- |
-| `F5` | toggle mechanism A (the `minimapExplore` calls) |
-| `F6` | print status (hook call counts, reveal count, patch state) to the log |
-| `F7` | toggle mechanism B (the drawing-gate patch) |
+| `Numpad 1` | toggle mechanism A (the `minimapExplore` calls) |
+| `Numpad 2` | toggle mechanism B (the drawing-gate patch) |
+| `Numpad 3` (or `F6`) | print status (hook call counts, reveal count, patch state) to the log |
+| `Numpad 0` | show / hide the status panel |
+
+The numpad keys are read through a low-level keyboard hook, so they work whether NumLock
+is on or off, and only while the game window has focus.
 
 Log file: `<game>\aurie.log` (also shown in the "Aurie Framework Log" console window).
 
@@ -111,7 +120,9 @@ Expected log output:
 [MapReveal] minimapUpdate hooked at ...
 [MapReveal] world_gen_step hooked at ...
 [MapReveal] draw-gate patch = ON
-[MapReveal] loaded. F5=reveal F6=status F7=draw-gate
+[MapReveal] overlay: status panel thread running
+[MapReveal] numpad hotkeys: keyboard hook installed (works with NumLock on or off)
+[MapReveal] loaded. numpad 1=mechanism A numpad 2=mechanism B numpad 3=status numpad 0=panel
 [MapReveal] tick: worldGen=... reveals=... update=... refresh=...
 ```
 
@@ -120,6 +131,12 @@ Expected log output:
 ## Notes and limitations
 
 * Single-player, local, client-side. Save format is untouched.
+* The status panel is a layered topmost window, so it needs a windowed or borderless-fullscreen
+  display mode; in exclusive fullscreen Windows does not composite other windows on top of the
+  game, and the panel will not be visible (the hotkeys keep working).
+* The panel scales with the width of the game window (reference layout: 1512 px client width,
+  clamped to 75–175 %), so it keeps roughly the same proportions at any resolution. It is drawn
+  by a separate layered window with GDI, independent of the game's D3D11 renderer.
 * The offsets are specific to the tested `Chronicon.exe` build. If the game updates, the
   signature checks fail and the mod disables itself — open an issue with the new
   `Chronicon.exe` SHA256 and the RVA list can be updated.

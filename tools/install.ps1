@@ -116,4 +116,5 @@ Write-Host ''
 Write-Host 'Installed. The map will now stay fully revealed.' -ForegroundColor Green
 Write-Host "  mod      : $ModsDir\ChroniconMapReveal.dll"
 Write-Host "  log      : $GameDir\aurie.log"
-Write-Host '  hotkeys  : F5 reveal toggle / F6 status / F7 draw-gate toggle'
+Write-Host '  panel    : on/off state of both mechanisms, drawn in the top-right corner of the game window'
+Write-Host '  hotkeys  : numpad 1 = mechanism A / numpad 2 = mechanism B / numpad 3 = print status / numpad 0 = panel'

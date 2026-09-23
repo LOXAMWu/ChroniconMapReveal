@@ -86,7 +86,7 @@ generated before the patch was installed.
 
 Side effect of mechanism B: the loop reads one cell past the end of a 50×2 helper grid,
 so the game's own debug console prints `Grid N, index out of bounds reading [...]` lines.
-It is harmless (the game does the same read on the drawing path) and can be silenced with `F7`.
+It is harmless (the game does the same read on the drawing path) and can be silenced with `Numpad 2`.
 
 ## 5. Loader
 
@@ -96,11 +96,44 @@ used from a MinGW-built module — the header's inline wrapper generates Itanium
 `AurieCore.dll` is MSVC-built — so the hooks are installed with MinHook instead, which is
 compiled into the mod from source.
 
-## 6. Updating for a new game build
+## 6. Status panel and key input
+
+Both live outside the hooking path and never touch game state.
+
+**Status panel — `src/overlay.cpp`.**
+
+A background thread owns a `WS_POPUP` window with
+`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`, renders
+into a 32-bit top-down DIB and pushes it with `UpdateLayeredWindow` every 80 ms (and only when
+something actually changed). It reads the two `volatile LONG` state flags and the game window
+geometry (`GetClientRect` + `ClientToScreen`, re-evaluated on every tick) so it follows window
+moves, resizes and DPI changes, and hides itself when the game window is not in the foreground.
+
+Text rendering avoids both GDI+ and the game's D3D11 pipeline: each string is drawn white-on-black
+into a scratch DIB with GDI (`ANTIALIASED_QUALITY`, so coverage is grayscale), the luminance of
+that DIB is the coverage mask, and the mask is composited with the wanted colour/alpha into the
+premultiplied BGRA panel bitmap.
+
+Layout is written in "reference pixels" for a 1512 px wide client area and scaled by
+`client_width / 1512` clamped to 75–175 %, so the panel keeps the same proportions at any
+resolution or system scaling.
+
+**Numpad keys — `src/ChroniconMapReveal.cpp`.**
+
+A `WH_KEYBOARD_LL` hook runs on its own message-loop thread. It matches
+`KBDLLHOOKSTRUCT::scanCode` + the `LLKHF_EXTENDED` flag, which identifies the numpad digits
+whether NumLock is on or off (with NumLock off the same keys arrive as
+Insert/End/Down/PageDown but keep scan codes `0x52 / 0x4F / 0x50 / 0x51` and no extended flag).
+The hook only records "pressed" flags; the toggles are applied on the game thread from
+`world_gen_step`, so the drawing-gate patch — which rewrites code bytes — is never applied while
+another thread could be executing that instruction. If `SetWindowsHookExW` fails, the mod falls
+back to polling `GetAsyncKeyState(VK_NUMPAD0..3)`, which needs NumLock on.
+
+## 7. Updating for a new game build
 
 1. Get the new `Chronicon.exe` SHA256 and open an issue.
 2. Re-locate the scripts (name → address mapping, section 2) and refresh the `RVA_*` constants
    and `PROLOGUE_*` byte patterns in `src/ChroniconMapReveal.cpp`.
 3. Re-check the drawing-gate instruction in `minimapRefresh` (`DRAW_GATE_ORIGINAL`) — it is a
    6-byte `je rel32`; only its existence and target semantics need to hold.
-4. Rebuild and re-test with `F6` status output and `aurie.log`.
+4. Rebuild and re-test with `F6` / `Numpad 3` status output and `aurie.log`.

@@ -63,7 +63,8 @@ Write-Host "Using: $($toolchain.Gxx)"
 $includeAurie = Join-Path $PSScriptRoot 'third_party\aurie'
 $includeMinHook = Join-Path $PSScriptRoot 'third_party\minhook\include'
 $minhookSrc = Join-Path $PSScriptRoot 'third_party\minhook\src'
-$source = Join-Path $PSScriptRoot 'src\ChroniconMapReveal.cpp'
+$sourceDir = Join-Path $PSScriptRoot 'src'
+$sources = @('ChroniconMapReveal.cpp', 'overlay.cpp')
 
 $objDir = Join-Path $OutDir 'obj'
 New-Item -ItemType Directory -Force -Path $objDir | Out-Null
@@ -86,15 +87,28 @@ Write-Host '  compiling hde64.c'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $objects += $hdeObj
 
+$cxxFlags = @(
+    '-std=c++20', '-O2', '-DNDEBUG', '-DWIN32_LEAN_AND_MEAN',
+    '-finput-charset=UTF-8', '-fexec-charset=UTF-8', '-fwide-exec-charset=UTF-16LE'
+)
+
+foreach ($name in $sources) {
+    $obj = Join-Path $objDir ($name -replace '\.cpp$', '.o')
+    Write-Host "  compiling $name"
+    & $toolchain.Gxx @cxxFlags -c -I $includeAurie -I $includeMinHook -I $sourceDir (Join-Path $sourceDir $name) -o $obj
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $objects += $obj
+}
+
 $dll = Join-Path $OutDir 'ChroniconMapReveal.dll'
 Write-Host '  linking ChroniconMapReveal.dll'
 & $toolchain.Gxx `
-    -std=c++20 -O2 -shared -DNDEBUG -DWIN32_LEAN_AND_MEAN `
+    @cxxFlags -shared `
     -I $includeAurie -I $includeMinHook `
-    $source @objects `
+    @objects `
     -o $dll `
     -static -static-libgcc -static-libstdc++ `
-    -luser32 -Wno-unknown-pragmas -Wno-ignored-attributes
+    -luser32 -lgdi32 -Wno-unknown-pragmas -Wno-ignored-attributes
 
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
