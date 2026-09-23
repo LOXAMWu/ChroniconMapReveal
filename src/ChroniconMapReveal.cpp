@@ -10,8 +10,15 @@
 //      (VA 0x141290B82 的 je -> 6 个 NOP), 使所有格子都被绘制。
 //      A + B 同时开启才能稳定生效 (只靠 A 时地图仍显示未探索样式)。
 //
-// 快捷键: 小键盘 1 = 开关机制 A, 小键盘 2 = 开关机制 B,
-//         小键盘 3 (或 F6) = 输出运行状态到日志, 小键盘 0 = 显示/隐藏右上角状态面板
+// 工作方式 (默认):
+//   B (绘制判定补丁) 常开, 保证所有格子都会被绘制;
+//   A (反复调用 minimapExplore) 只在进入区域后脉冲一次 —— 进区域 1 秒后开启, 0.5 秒后关闭,
+//   把 "已探索" 网格刷成全开就够了, 不需要一直调用。
+//
+// 快捷键: 小键盘 1 = 手动脉冲一次机制 A, 2 = 开关机制 B, 3 = 输出状态,
+//         0 = 显示/隐藏状态面板, 9 = 改键模式 (每按一次改下一个动作)
+// 键位保存在 <Mod 同目录>\ChroniconMapReveal.ini, 在游戏里改键会写回该文件,
+// 手动编辑该文件后游戏内最多 1 秒自动生效 (见 src/hotkeys.cpp)。
 // 状态面板: 屏幕右上角实时显示两个机制的开启状态 (见 src/overlay.cpp)
 //
 // 所有目标函数在挂钩/改写前都会校验机器码签名, 版本不符则跳过 (不破坏游戏)。
@@ -19,11 +26,14 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <MinHook.h>
 #include <Aurie/shared.hpp>
 
+#include "hotkeys.hpp"
 #include "overlay.hpp"
 
 using namespace Aurie;
@@ -70,9 +80,11 @@ static GmlScriptFn g_OrigMinimapUpdate = nullptr;
 static GmlScriptFn g_OrigWorldGenStep = nullptr;
 
 static volatile LONG g_Ready = 0;
-static volatile LONG g_RevealEnabled = 1;   // 机制 A
+static volatile LONG g_RevealEnabled = 0;   // 机制 A (由脉冲逻辑驱动, 不是长开)
 static volatile LONG g_GatePatched = 0;     // 机制 B
 static volatile LONG g_InReveal = 0;
+static volatile LONG64 g_ZoneEnterTick = 0;    // 进入区域的时间 (0 = 还没进过区域)
+static volatile LONG64 g_ManualPulseUntil = 0; // 手动脉冲的结束时间
 
 static volatile LONG64 g_IniCalls = 0;
 static volatile LONG64 g_RefreshCalls = 0;
@@ -83,127 +95,9 @@ static volatile LONG64 g_Reveals = 0;
 
 // ------------------------------------------------------------------ hotkeys
 
-// 小键盘按键: 0 = 显示/隐藏面板, 1 = 机制 A, 2 = 机制 B, 3 = 输出状态
-enum NumpadSlot
-{
-	NUMPAD_SLOT_PANEL = 0,
-	NUMPAD_SLOT_REVEAL = 1,
-	NUMPAD_SLOT_DRAW_GATE = 2,
-	NUMPAD_SLOT_STATUS = 3,
-	NUMPAD_SLOT_COUNT = 4
-};
-
-static volatile LONG g_HotkeyPending[NUMPAD_SLOT_COUNT] = { 0, 0, 0, 0 };
-static bool g_HotkeyDown[NUMPAD_SLOT_COUNT] = { false, false, false, false };  // 只由键盘钩子线程读写
-static volatile LONG g_KeyboardHookActive = 0;
-
 static void OverlayLog(const char* message)
 {
 	DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] %s", message);
-}
-
-static bool GameIsForeground()
-{
-	HWND foreground = GetForegroundWindow();
-	if (!foreground)
-		return false;
-
-	DWORD process_id = 0;
-	GetWindowThreadProcessId(foreground, &process_id);
-	return process_id == GetCurrentProcessId();
-}
-
-// 小键盘数字键的扫描码。NumLock 关闭时这些键会变成 Insert/End/Down/PageDown,
-// 但扫描码不变、而且不带扩展位, 所以用扫描码判断可以两种状态通吃。
-static int NumpadSlotFromScanCode(const KBDLLHOOKSTRUCT& key)
-{
-	if ((key.flags & LLKHF_EXTENDED) != 0)
-		return -1;  // 带扩展位的是方向键 / 编辑键区, 不是小键盘
-
-	switch (key.scanCode)
-	{
-	case 0x52: return NUMPAD_SLOT_PANEL;      // 小键盘 0
-	case 0x4F: return NUMPAD_SLOT_REVEAL;     // 小键盘 1
-	case 0x50: return NUMPAD_SLOT_DRAW_GATE;  // 小键盘 2
-	case 0x51: return NUMPAD_SLOT_STATUS;     // 小键盘 3
-	default: return -1;
-	}
-}
-
-static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wparam, LPARAM lparam)
-{
-	if (code == HC_ACTION)
-	{
-		const KBDLLHOOKSTRUCT& key = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(lparam);
-		const int slot = NumpadSlotFromScanCode(key);
-		if (slot >= 0)
-		{
-			if (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN)
-			{
-				if (!g_HotkeyDown[slot])  // 忽略长按产生的重复
-				{
-					g_HotkeyDown[slot] = true;
-					if (GameIsForeground())
-						InterlockedExchange(&g_HotkeyPending[slot], 1);
-				}
-			}
-			else if (wparam == WM_KEYUP || wparam == WM_SYSKEYUP)
-			{
-				g_HotkeyDown[slot] = false;
-			}
-		}
-	}
-	return CallNextHookEx(nullptr, code, wparam, lparam);
-}
-
-static DWORD WINAPI KeyboardHookThread(LPVOID)
-{
-	HMODULE module = nullptr;
-	if (!GetModuleHandleExW(
-			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			reinterpret_cast<LPCWSTR>(&LowLevelKeyboardProc),
-			&module))
-	{
-		module = GetModuleHandleW(nullptr);
-	}
-
-	HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, module, 0);
-	if (hook)
-		InterlockedExchange(&g_KeyboardHookActive, 1);
-
-	DbgPrintEx(
-		LOG_SEVERITY_INFO,
-		"[MapReveal] numpad hotkeys: %s",
-		hook
-			? "keyboard hook installed (works with NumLock on or off)"
-			: "hook unavailable, polling instead (needs NumLock on)"
-	);
-
-	MSG message;
-	while (GetMessageW(&message, nullptr, 0, 0) > 0)
-	{
-		TranslateMessage(&message);
-		DispatchMessageW(&message);
-	}
-
-	if (hook)
-		UnhookWindowsHookEx(hook);
-	return 0;
-}
-
-// 取一次按键事件 (取到就清掉)。钩子线程记录的优先; 钩子没装上时退回轮询 (需 NumLock 打开)。
-static bool TakeHotkey(int slot, int virtual_key)
-{
-	if (InterlockedExchange(&g_HotkeyPending[slot], 0) != 0)
-		return true;
-
-	if (InterlockedCompareExchange(&g_KeyboardHookActive, 0, 0) == 0 &&
-		(GetAsyncKeyState(virtual_key) & 0x1) != 0 &&
-		GameIsForeground())
-	{
-		return true;
-	}
-	return false;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -277,33 +171,198 @@ static bool SetDrawGatePatch(bool enable)
 	return true;
 }
 
-static void HandleHotkeys()
+// ------------------------------------------------- 面板文字 / 提示 / 改键状态
+
+static int g_RebindAction = 0;			// 下一次改键改的是哪个动作
+static ULONGLONG g_ToastUntil = 0;		// 提示文字什么时候过期 (0 = 没有提示)
+static wchar_t g_ToastText[160] = L"";
+static unsigned g_PanelVersion = 0xFFFFFFFF;
+static bool g_PanelCapturing = false;
+
+static void RefreshPanelText(bool force)
 {
-	// 小键盘 1: 机制 A
-	if (TakeHotkey(NUMPAD_SLOT_REVEAL, VK_NUMPAD1))
+	const unsigned version = mr_hotkeys::BindingVersion();
+	const bool capturing = mr_hotkeys::IsCapturing();
+	if (!force && version == g_PanelVersion && capturing == g_PanelCapturing)
+		return;
+
+	g_PanelVersion = version;
+	g_PanelCapturing = capturing;
+
+	mr_overlay::SetRowKey(0, mr_hotkeys::BindingText(mr_hotkeys::ACTION_PULSE).c_str());
+	mr_overlay::SetRowKey(1, mr_hotkeys::BindingText(mr_hotkeys::ACTION_DRAW_GATE).c_str());
+
+	if (capturing)
 	{
-		LONG current = InterlockedCompareExchange(&g_RevealEnabled, 1, 1);
-		InterlockedExchange(&g_RevealEnabled, current ? 0 : 1);
-		DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] mechanism A (explore calls) = %s", current ? "OFF" : "ON");
+		wchar_t text[160] = L"";
+		_snwprintf(
+			text, 160, L"【改键】%s → 请按新键",
+			mr_hotkeys::ActionName(static_cast<mr_hotkeys::Action>(g_RebindAction))
+		);
+		mr_overlay::SetBottomLine(text);
+		return;
 	}
 
-	// 小键盘 2: 机制 B
-	if (TakeHotkey(NUMPAD_SLOT_DRAW_GATE, VK_NUMPAD2))
+	if (g_ToastUntil != 0 && GetTickCount64() < g_ToastUntil)
+	{
+		mr_overlay::SetBottomLine(g_ToastText);
+		return;
+	}
+
+	wchar_t text[160] = L"";
+	_snwprintf(
+		text, 160, L"面板 %s · 改键 %s",
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_PANEL).c_str(),
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_REBIND).c_str()
+	);
+	mr_overlay::SetBottomLine(text);
+}
+
+static void SetToast(const wchar_t* text)
+{
+	lstrcpynW(g_ToastText, text, 160);
+	g_ToastUntil = GetTickCount64() + 2500;
+	RefreshPanelText(true);
+}
+
+static void PrintStatus()
+{
+	DbgPrintEx(
+		LOG_SEVERITY_INFO,
+		"[MapReveal] status: ini=%lld refresh=%lld setArea=%lld update=%lld worldGen=%lld reveals=%lld gate=%d auto=%d",
+		g_IniCalls, g_RefreshCalls, g_SetAreaCalls, g_UpdateCalls, g_WorldGenCalls, g_Reveals,
+		InterlockedCompareExchange(&g_GatePatched, 0, 0),
+		InterlockedCompareExchange(&g_RevealEnabled, 0, 0)
+	);
+
+	DbgPrintEx(
+		LOG_SEVERITY_INFO,
+		"[MapReveal] keys: pulse=%ls draw_gate=%ls status=%ls panel=%ls rebind=%ls | auto=%d delay=%dms hold=%dms",
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_PULSE).c_str(),
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_DRAW_GATE).c_str(),
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_STATUS).c_str(),
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_PANEL).c_str(),
+		mr_hotkeys::BindingText(mr_hotkeys::ACTION_REBIND).c_str(),
+		mr_hotkeys::AutoPulseEnabled() ? 1 : 0,
+		mr_hotkeys::AutoPulseDelayMs(),
+		mr_hotkeys::AutoPulseHoldMs()
+	);
+}
+
+static void HandleHotkeys()
+{
+	const ULONGLONG now = GetTickCount64();
+
+	// 改键结果 (Esc = 取消)
+	mr_hotkeys::KeySpec captured;
+	if (mr_hotkeys::TakeCapturedKey(captured))
+	{
+		if (captured.vk == VK_ESCAPE && !captured.use_scan && captured.mods == 0)
+		{
+			SetToast(L"已取消改键");
+		}
+		else
+		{
+			const mr_hotkeys::Action action = static_cast<mr_hotkeys::Action>(g_RebindAction);
+			if (mr_hotkeys::SetBinding(action, captured))
+			{
+				wchar_t text[160] = L"";
+				_snwprintf(
+					text, 160, L"已绑定 %s = %s",
+					mr_hotkeys::ActionName(action),
+					mr_hotkeys::BindingText(action).c_str()
+				);
+				SetToast(text);
+				g_RebindAction = (g_RebindAction + 1) % mr_hotkeys::ACTION_COUNT;
+			}
+			else
+			{
+				SetToast(L"这个键已经被其它动作占用");
+			}
+		}
+		mr_hotkeys::CaptureNextKey(false);
+	}
+
+	// 进入 / 退出改键模式
+	if (mr_hotkeys::TakeAction(mr_hotkeys::ACTION_REBIND))
+	{
+		if (mr_hotkeys::IsCapturing())
+		{
+			mr_hotkeys::CaptureNextKey(false);
+			SetToast(L"已取消改键");
+		}
+		else
+		{
+			mr_overlay::SetVisible(true);	// 改键提示一定要看得见
+			mr_hotkeys::CaptureNextKey(true);
+			DbgPrintEx(
+				LOG_SEVERITY_INFO,
+				"[MapReveal] rebind: waiting for a key for %ls",
+				mr_hotkeys::ActionName(static_cast<mr_hotkeys::Action>(g_RebindAction))
+			);
+			RefreshPanelText(true);
+		}
+	}
+
+	// 手动脉冲一次机制 A
+	if (mr_hotkeys::TakeAction(mr_hotkeys::ACTION_PULSE))
+	{
+		const int hold = mr_hotkeys::AutoPulseHoldMs();
+		InterlockedExchange64(&g_ManualPulseUntil, static_cast<LONG64>(now + hold));
+		DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] manual pulse: mechanism A on for %d ms", hold);
+	}
+
+	// 机制 B 开关 (默认常开)
+	if (mr_hotkeys::TakeAction(mr_hotkeys::ACTION_DRAW_GATE))
 		SetDrawGatePatch(InterlockedCompareExchange(&g_GatePatched, 0, 0) == 0);
 
-	// 小键盘 3 (或 F6): 输出状态到日志
-	if (TakeHotkey(NUMPAD_SLOT_STATUS, VK_NUMPAD3) || (GetAsyncKeyState(VK_F6) & 0x1))
-		DbgPrintEx(
-			LOG_SEVERITY_INFO,
-			"[MapReveal] status: ini=%lld refresh=%lld setArea=%lld update=%lld worldGen=%lld reveals=%lld gate=%d auto=%d",
-			g_IniCalls, g_RefreshCalls, g_SetAreaCalls, g_UpdateCalls, g_WorldGenCalls, g_Reveals,
-			InterlockedCompareExchange(&g_GatePatched, 0, 0),
-			InterlockedCompareExchange(&g_RevealEnabled, 0, 0)
-		);
+	if (mr_hotkeys::TakeAction(mr_hotkeys::ACTION_STATUS))
+		PrintStatus();
 
-	// 小键盘 0: 显示 / 隐藏状态面板
-	if (TakeHotkey(NUMPAD_SLOT_PANEL, VK_NUMPAD0))
+	if (mr_hotkeys::TakeAction(mr_hotkeys::ACTION_PANEL))
 		mr_overlay::ToggleVisible();
+
+	// ini 被手动改过就重新加载
+	mr_hotkeys::PollConfigFile();
+
+	// 提示文字到期后恢复成键位提示
+	if (g_ToastUntil != 0 && now >= g_ToastUntil)
+	{
+		g_ToastUntil = 0;
+		g_ToastText[0] = 0;
+		RefreshPanelText(true);
+	}
+	RefreshPanelText(false);
+
+	// 机制 A: 进区域后 delay 开启 / hold 后关闭, 外加手动脉冲
+	bool enabled = false;
+	const wchar_t* reason = L"idle";
+
+	if (mr_hotkeys::AutoPulseEnabled())
+	{
+		const ULONGLONG zone = static_cast<ULONGLONG>(InterlockedCompareExchange64(&g_ZoneEnterTick, 0, 0));
+		if (zone != 0)
+		{
+			const ULONGLONG elapsed = now - zone;
+			const ULONGLONG delay = static_cast<ULONGLONG>(mr_hotkeys::AutoPulseDelayMs());
+			const ULONGLONG hold = static_cast<ULONGLONG>(mr_hotkeys::AutoPulseHoldMs());
+			if (elapsed >= delay && elapsed < delay + hold)
+			{
+				enabled = true;
+				reason = L"zone pulse";
+			}
+		}
+	}
+
+	if (now < static_cast<ULONGLONG>(InterlockedCompareExchange64(&g_ManualPulseUntil, 0, 0)))
+	{
+		enabled = true;
+		reason = L"manual pulse";
+	}
+
+	const LONG wanted = enabled ? 1 : 0;
+	if (InterlockedExchange(&g_RevealEnabled, wanted) != wanted)
+		DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] mechanism A = %s (%ls)", enabled ? "ON" : "OFF", reason);
 }
 
 // ------------------------------------------------------------------ detours
@@ -331,6 +390,17 @@ static void* MinimapSetAreaDetour(void* self, void* other, void* result, int arg
 	LogCall("minimapSetArea", &g_SetAreaCalls, self, other);
 	void* value = g_OrigMinimapSetArea(self, other, result, argument_count, arguments);
 	InterlockedExchange(&g_Ready, 1);
+
+	// 进入 / 生成区域: 记下时间, 机制 A 会在 delay 毫秒后自动脉冲一次 (hold 毫秒后关闭)
+	const ULONGLONG zone_tick = GetTickCount64();
+	const LONG64 previous_zone = InterlockedExchange64(&g_ZoneEnterTick, static_cast<LONG64>(zone_tick));
+	if (mr_hotkeys::AutoPulseEnabled() && (previous_zone == 0 || zone_tick - static_cast<ULONGLONG>(previous_zone) > 1000))
+		DbgPrintEx(
+			LOG_SEVERITY_INFO,
+			"[MapReveal] zone entered: mechanism A pulses in %d ms for %d ms",
+			mr_hotkeys::AutoPulseDelayMs(),
+			mr_hotkeys::AutoPulseHoldMs()
+		);
 
 	if (InterlockedCompareExchange(&g_RevealEnabled, 0, 0))
 		RevealMap(self, other);
@@ -410,9 +480,8 @@ EXPORTED AurieStatus ModuleInitialize(
 )
 {
 	(void)Module;
-	(void)ModulePath;
 
-	DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] init (multi-trigger + draw-gate patch)");
+	DbgPrintEx(LOG_SEVERITY_INFO, "[MapReveal] init (draw-gate always on + reveal pulse)");
 
 	unsigned char* explore = reinterpret_cast<unsigned char*>(GameAddress(RVA_MINIMAP_EXPLORE));
 	if (!BytesEqual(explore, PROLOGUE_EXPLORE, sizeof(PROLOGUE_EXPLORE)))
@@ -447,19 +516,29 @@ EXPORTED AurieStatus ModuleInitialize(
 	// 机制 B: 默认开启 (与机制 A 配合才能稳定生效)
 	SetDrawGatePatch(true);
 
+	// 热键 + 设置文件 (与 <Mod>.dll 同目录: mods\aurie\ChroniconMapReveal.ini)
+	std::wstring ini_path;
+	if (!ModulePath.empty())
+	{
+		ini_path = ModulePath.wstring();
+		const size_t dot = ini_path.find_last_of(L'.');
+		const size_t slash = ini_path.find_last_of(L"\\/");
+		if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash))
+			ini_path.erase(dot);
+		ini_path += L".ini";
+	}
+	mr_hotkeys::Start(ini_path);
+
 	// 右上角状态面板
 	mr_overlay::Start(&g_RevealEnabled, &g_GatePatched, OverlayLog);
-
-	// 小键盘热键 (低层键盘钩子, 需要自己的消息循环)
-	HANDLE hotkey_thread = CreateThread(nullptr, 0, KeyboardHookThread, nullptr, 0, nullptr);
-	if (hotkey_thread)
-		CloseHandle(hotkey_thread);
-	else
-		DbgPrintEx(LOG_SEVERITY_ERROR, "[MapReveal] hotkey thread failed to start");
+	RefreshPanelText(true);
 
 	DbgPrintEx(
 		LOG_SEVERITY_INFO,
-		"[MapReveal] loaded. numpad 1=mechanism A numpad 2=mechanism B numpad 3=status numpad 0=panel"
+		"[MapReveal] loaded: B always on, A pulses %d ms after a zone entry for %d ms",
+		mr_hotkeys::AutoPulseDelayMs(),
+		mr_hotkeys::AutoPulseHoldMs()
 	);
+	PrintStatus();
 	return AURIE_SUCCESS;
 }

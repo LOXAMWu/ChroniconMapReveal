@@ -44,6 +44,7 @@ namespace mr_overlay
 
 		const COLORREF kColorTitle = RGB(170, 180, 198);
 		const COLORREF kColorLabel = RGB(233, 237, 244);
+		const COLORREF kColorKey = RGB(146, 156, 174);
 		const COLORREF kColorHint = RGB(142, 152, 168);
 		const COLORREF kColorOn = RGB(122, 229, 152);
 		const COLORREF kColorOff = RGB(255, 138, 128);
@@ -51,6 +52,9 @@ namespace mr_overlay
 		const int kBackgroundAlpha = 196;
 		const int kHighlightAlpha = 224;	// 刚切换过状态时更实一点, 给个视觉反馈
 		const ULONGLONG kHighlightMs = 1200;
+
+		const int kRowKeyLength = 32;
+		const int kBottomLength = 192;
 
 		struct Surface
 		{
@@ -79,14 +83,23 @@ namespace mr_overlay
 
 		HFONT g_font_title = nullptr;
 		HFONT g_font_label = nullptr;
+		HFONT g_font_key = nullptr;
 		HFONT g_font_state = nullptr;
 		HFONT g_font_hint = nullptr;
 		int g_scale = 100;	// 百分数
+
+		// 面板文字 (由 Mod 线程写, 面板线程读)
+		INIT_ONCE g_text_once = INIT_ONCE_STATIC_INIT;
+		CRITICAL_SECTION g_text_lock;
+		wchar_t g_row_key[2][kRowKeyLength] = { L"", L"" };
+		wchar_t g_bottom_line[kBottomLength] = L"";
+		volatile LONG g_text_version = 0;
 
 		bool g_have_rendered = false;
 		bool g_surface_error_logged = false;
 		LONG g_rendered_a = -1;
 		LONG g_rendered_b = -1;
+		LONG g_rendered_text = -1;
 		int g_rendered_x = 0;
 		int g_rendered_y = 0;
 		int g_rendered_width = 0;
@@ -103,6 +116,17 @@ namespace mr_overlay
 		{
 			if (g_log)
 				g_log(message);
+		}
+
+		BOOL CALLBACK InitTextLock(PINIT_ONCE, PVOID, PVOID*)
+		{
+			InitializeCriticalSection(&g_text_lock);
+			return TRUE;
+		}
+
+		void EnsureTextLock()
+		{
+			InitOnceExecuteOnce(&g_text_once, InitTextLock, nullptr, nullptr);
 		}
 
 		LONG ReadState(const volatile long* cell)
@@ -235,7 +259,7 @@ namespace mr_overlay
 				return;
 
 			g_scale = scale;
-			HFONT* fonts[] = { &g_font_title, &g_font_label, &g_font_state, &g_font_hint };
+			HFONT* fonts[] = { &g_font_title, &g_font_label, &g_font_key, &g_font_state, &g_font_hint };
 			for (HFONT* font : fonts)
 			{
 				if (*font)
@@ -247,6 +271,7 @@ namespace mr_overlay
 
 			g_font_title = CreatePanelFont(13, FW_NORMAL);
 			g_font_label = CreatePanelFont(14, FW_NORMAL);
+			g_font_key = CreatePanelFont(11, FW_NORMAL);
 			g_font_state = CreatePanelFont(14, FW_BOLD);
 			g_font_hint = CreatePanelFont(11, FW_NORMAL);
 		}
@@ -281,14 +306,14 @@ namespace mr_overlay
 
 		// ------------------------------------------------------------ drawing
 
-		void DrawStateRow(int width, int top, const wchar_t* label, bool enabled)
+		void DrawStateRow(int width, int top, const wchar_t* label, const wchar_t* key_text, bool enabled)
 		{
 			const int padding = Px(kPadding);
 			const int height = Px(22);
 
 			DrawTextElement(
 				label,
-				RECT{ padding, top, width - Px(78), top + height },
+				RECT{ padding, top, width - Px(112), top + height },
 				g_font_label,
 				DT_LEFT | DT_VCENTER | DT_SINGLELINE,
 				kColorLabel,
@@ -296,8 +321,17 @@ namespace mr_overlay
 			);
 
 			DrawTextElement(
+				key_text,
+				RECT{ width - Px(114), top, width - Px(64), top + height },
+				g_font_key,
+				DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+				kColorKey,
+				255
+			);
+
+			DrawTextElement(
 				enabled ? kStateOn : kStateOff,
-				RECT{ width - Px(78), top, width - padding, top + height },
+				RECT{ width - Px(62), top, width - padding, top + height },
 				g_font_state,
 				DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
 				enabled ? kColorOn : kColorOff,
@@ -307,6 +341,16 @@ namespace mr_overlay
 
 		void RenderPanel(int width, int height, bool state_a, bool state_b, int alpha)
 		{
+			wchar_t row_key[2][kRowKeyLength] = { L"", L"" };
+			wchar_t bottom[kBottomLength] = L"";
+
+			EnsureTextLock();
+			EnterCriticalSection(&g_text_lock);
+			lstrcpynW(row_key[0], g_row_key[0], kRowKeyLength);
+			lstrcpynW(row_key[1], g_row_key[1], kRowKeyLength);
+			lstrcpynW(bottom, g_bottom_line, kBottomLength);
+			LeaveCriticalSection(&g_text_lock);
+
 			std::memset(g_panel_surface.pixels, 0, static_cast<size_t>(width) * height * 4);
 
 			FillRectAlpha(g_panel_surface, RECT{ 0, 0, width, height }, RGB(0, 0, 0), alpha);
@@ -325,11 +369,11 @@ namespace mr_overlay
 			const int separator = Px(32);
 			FillRectAlpha(g_panel_surface, RECT{ padding, separator, width - padding, separator + 1 }, RGB(255, 255, 255), 36);
 
-			DrawStateRow(width, Px(36), kLabelA, state_a);
-			DrawStateRow(width, Px(58), kLabelB, state_b);
+			DrawStateRow(width, Px(36), kLabelA, row_key[0], state_a);
+			DrawStateRow(width, Px(58), kLabelB, row_key[1], state_b);
 
 			DrawTextElement(
-				kHint,
+				bottom[0] ? bottom : kHint,
 				RECT{ padding, Px(78), width - padding, Px(96) },
 				g_font_hint,
 				DT_LEFT | DT_VCENTER | DT_SINGLELINE,
@@ -468,6 +512,7 @@ namespace mr_overlay
 
 			const LONG state_a = ReadState(g_state_a);
 			const LONG state_b = ReadState(g_state_b);
+			const LONG text_version = InterlockedCompareExchange(&g_text_version, 0, 0);
 			const ULONGLONG now = GetTickCount64();
 			if (state_a != g_last_a || state_b != g_last_b)
 			{
@@ -478,6 +523,7 @@ namespace mr_overlay
 			const int alpha = (now - g_last_change_tick) < kHighlightMs ? kHighlightAlpha : kBackgroundAlpha;
 
 			if (g_have_rendered && g_rendered_a == state_a && g_rendered_b == state_b &&
+				g_rendered_text == text_version &&
 				g_rendered_x == x && g_rendered_y == y &&
 				g_rendered_width == width && g_rendered_height == height &&
 				g_rendered_alpha == alpha)
@@ -507,6 +553,7 @@ namespace mr_overlay
 			g_have_rendered = true;
 			g_rendered_a = state_a;
 			g_rendered_b = state_b;
+			g_rendered_text = text_version;
 			g_rendered_x = x;
 			g_rendered_y = y;
 			g_rendered_width = width;
@@ -608,7 +655,33 @@ namespace mr_overlay
 	void ToggleVisible()
 	{
 		const LONG visible = InterlockedCompareExchange(&g_user_visible, 0, 0);
-		InterlockedExchange(&g_user_visible, visible ? 0 : 1);
-		LogMessage(visible ? "overlay: status panel hidden by hotkey" : "overlay: status panel shown by hotkey");
+		SetVisible(visible == 0);
+	}
+
+	void SetVisible(bool visible)
+	{
+		InterlockedExchange(&g_user_visible, visible ? 1 : 0);
+		LogMessage(visible ? "overlay: status panel shown" : "overlay: status panel hidden");
+	}
+
+	void SetRowKey(int row, const wchar_t* key_text)
+	{
+		if (row < 0 || row >= 2)
+			return;
+
+		EnsureTextLock();
+		EnterCriticalSection(&g_text_lock);
+		lstrcpynW(g_row_key[row], key_text ? key_text : L"", kRowKeyLength);
+		LeaveCriticalSection(&g_text_lock);
+		InterlockedIncrement(&g_text_version);
+	}
+
+	void SetBottomLine(const wchar_t* text)
+	{
+		EnsureTextLock();
+		EnterCriticalSection(&g_text_lock);
+		lstrcpynW(g_bottom_line, text ? text : L"", kBottomLength);
+		LeaveCriticalSection(&g_text_lock);
+		InterlockedIncrement(&g_text_version);
 	}
 }

@@ -116,5 +116,6 @@ Write-Host ''
 Write-Host 'Installed. The map will now stay fully revealed.' -ForegroundColor Green
 Write-Host "  mod      : $ModsDir\ChroniconMapReveal.dll"
 Write-Host "  log      : $GameDir\aurie.log"
+Write-Host '  behaviour: drawing-gate patch always on, map reveal pulses 1s after each zone entry for 0.5s'
 Write-Host '  panel    : on/off state of both mechanisms, drawn in the top-right corner of the game window'
-Write-Host '  hotkeys  : numpad 1 = mechanism A / numpad 2 = mechanism B / numpad 3 = print status / numpad 0 = panel'
+Write-Host '  hotkeys  : numpad 1 = pulse / 2 = drawing gate / 3 = status / 0 = panel / 9 = rebind (see mods\aurie\ChroniconMapReveal.ini)'

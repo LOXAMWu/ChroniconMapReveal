@@ -30,20 +30,17 @@ ds_grid_clear(mapexplore, 1);   // 把“已探索”网格全部置 1
 minimapRefresh();               // 重绘小地图
 ```
 
-触发点（多点冗余，保证持续生效）：
+`gml_Script_minimapSetArea` 在区域小地图（重新）建立时触发，Mod 把它当作“进入区域”的信号：
+**进入区域 1 秒后机制 A 开启，再过 0.5 秒关闭**（两个数值都能在 ini 里改）。网格清一次就够了
+—— 这些值会一直保留到该区域被重新生成。`minimapUpdate` / `minimapRefresh` / `world_gen_step`
+也仍然挂着钩子，脉冲期间它们触发的调用照常生效。
 
-| 挂钩函数 | 触发时机 |
-| --- | --- |
-| `gml_Script_minimapSetArea` | 区域小地图初始化 |
-| `gml_Script_minimapUpdate` | 每次小地图更新 |
-| `gml_Script_minimapRefresh` | 每次小地图重绘 |
-| `gml_Script_world_gen_step` | 每 30 帧兜底 |
-
-**机制 B —— 跳过绘制时的“未探索就不画”判定**
+**机制 B —— 跳过绘制时的“未探索就不画”判定（常开）**
 
 小地图绘制循环会跳过未探索的格子；Mod 在运行时把该条件跳转改成 NOP（VA `0x141290B82`）。
 
 > 实测：只开机制 A 时地图仍会以“未探索”样式渲染，A + B 同时开启才会彻底全开。
+> 所以 B 在加载时就打上并保持常开，A 才能“进区域点一下就够”，不必一直反复调用 `minimapExplore`。
 > 纯改 exe 字节的静态补丁无效，是因为那段分支只在**区域生成**时执行一次。
 
 更多细节（函数地址、逆向过程）见 [docs/technical-notes.md](docs/technical-notes.md)。
@@ -86,23 +83,55 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ## 快捷键与状态面板
 
 两个机制的当前状态会实时显示在**游戏窗口右上角**的小面板上（绿色 `开启` / 红色 `关闭`），
-位置在游戏自带区域名牌的下方；游戏窗口不在前台时面板自动隐藏。
+位置在游戏自带区域名牌的下方；游戏窗口不在前台时面板自动隐藏。每行还会显示当前绑定的按键
+（例如 `A 自动全开地图  小键盘1  开启`）。
 
 | 按键 | 功能 |
 | --- | --- |
-| `小键盘 1` | 开关机制 A（`minimapExplore` 调用） |
+| `小键盘 1` | 手动脉冲一次机制 A（与进区域一样：等 1 秒、开 0.5 秒） |
 | `小键盘 2` | 开关机制 B（绘制判定补丁） |
-| `小键盘 3`（或 `F6`） | 输出运行状态到日志 |
+| `小键盘 3` | 输出运行状态到日志（含当前键位） |
 | `小键盘 0` | 显示 / 隐藏状态面板 |
+| `小键盘 9` | 改键模式（见下） |
 
 小键盘按键用低层键盘钩子读取，NumLock 开或关都能用，并且只在游戏窗口处于前台时响应。
+
+## 修改快捷键
+
+两种方式改的都是同一个文件：`<游戏目录>\mods\aurie\ChroniconMapReveal.ini`（首次运行时生成，UTF-8）。
+
+* **游戏里改**：按 `小键盘 9`，面板显示 `【改键】<动作> → 请按新键`，按下想用的键即可（支持组合键，
+  例如按住 `Ctrl` 再按 `F5`），绑定立刻生效并写回 ini。再按一次 `小键盘 9` 改下一个动作，
+  按 `Esc` 取消。
+* **直接编辑 ini**：改完保存，游戏最多约 2 秒后自动生效，不用重启。键名写法如
+  `NUMPAD1` / `F5` / `A` / `SPACE` / `CTRL+F1`（大小写随意），同一个键只能绑给一个动作。
+
+```ini
+[keys]
+pulse=NUMPAD1        ; 手动触发一次机制 A
+draw_gate=NUMPAD2    ; 开关机制 B（默认常开）
+status=NUMPAD3       ; 输出状态到日志
+panel=NUMPAD0        ; 显示 / 隐藏面板
+rebind=NUMPAD9       ; 进入改键模式
+
+[auto]
+enabled=1            ; 进入区域后自动脉冲机制 A
+delay_ms=1000        ; 进入区域多少毫秒后开启
+hold_ms=500          ; 开启持续多少毫秒
+```
+
+把 `enabled` 改成 `0` 就关掉自动脉冲（此时只靠机制 B 也会把所有格子画出来，只是样式是“未探索”
+的那种）；哪个区域还显示迷雾，就把 `hold_ms` 调大一点。
 
 日志：`<游戏目录>\aurie.log`，同时显示在 “Aurie Framework Log” 控制台窗口里。
 
 ```
 [MapReveal] overlay: status panel thread running
-[MapReveal] numpad hotkeys: keyboard hook installed (works with NumLock on or off)
-[MapReveal] loaded. numpad 1=mechanism A numpad 2=mechanism B numpad 3=status numpad 0=panel
+[MapReveal] keys: pulse=小键盘1 draw_gate=小键盘2 status=小键盘3 panel=小键盘0 rebind=小键盘9 | auto=1 delay=1000ms hold=500ms
+[MapReveal] loaded: B always on, A pulses 1000 ms after a zone entry for 500 ms
+[MapReveal] zone entered: mechanism A pulses in 1000 ms for 500 ms
+[MapReveal] mechanism A = ON (zone pulse)
+[MapReveal] mechanism A = OFF (idle)
 ```
 
 ---
@@ -110,6 +139,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ## 说明
 
 * 单机、客户端本地生效，不影响存档格式。
+* 机制 A 不再常开：它只在进入区域后脉冲约 0.5 秒（外加 `小键盘 1` 手动触发一次），机制 B 保持常开。
+  如果哪个区域还显示迷雾，把 ini 里的 `hold_ms` 调大。
+* 键位存在 `<游戏目录>\mods\aurie\ChroniconMapReveal.ini`；删掉它，下次加载会恢复默认
+  （小键盘 1 / 2 / 3 / 0 / 9）。
 * 状态面板是一个置顶的 layered 窗口，所以需要窗口化 / 无边框全屏模式；真·独占全屏下系统不会
   合成其他窗口，面板看不见（快捷键仍然可用）。
 * 面板尺寸随游戏窗口宽度等比缩放（参考宽度 1512 px，限幅 75%–175%），分辨率变化时观感一致；

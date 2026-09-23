@@ -96,7 +96,27 @@ used from a MinGW-built module — the header's inline wrapper generates Itanium
 `AurieCore.dll` is MSVC-built — so the hooks are installed with MinHook instead, which is
 compiled into the mod from source.
 
-## 6. Status panel and key input
+## 6. Runtime behaviour: B always on, A as a pulse
+
+Since v1.1 the mod does **not** call `minimapExplore` continuously:
+
+| | |
+| --- | --- |
+| Mechanism B (drawing gate) | patched in at load and left on (`Numpad 2` toggles it manually) |
+| Mechanism A (`minimapExplore`) | switched on `delay_ms` after a zone entry and off `hold_ms` later (default 1000 / 500 ms) |
+| Zone entry | every `minimapSetArea` call |
+| `g_RevealEnabled` | derived each frame: `(now - zone_enter) in [delay, delay+hold)` or a manual `Numpad 1` pulse |
+
+Measured with the in-game log: `minimapSetArea` fires on zone setup/regeneration, not per frame
+(two calls in six minutes of one session, versus ~1800 `minimapUpdate` calls in the same window),
+so it is a usable "zone entered" signal. A zone's `mapexplore` grid keeps its values until the
+zone is regenerated, which is why a single ~0.5 s pulse per zone is enough. `[auto] enabled=0`
+in the ini disables the automatic pulse; `delay_ms` / `hold_ms` tune it.
+
+All reveal calls still happen on the game thread inside the hooks; the pulse only decides whether
+`g_RevealEnabled` is 0 or 1.
+
+## 7. Status panel and key input
 
 Both live outside the hooking path and never touch game state.
 
@@ -118,22 +138,34 @@ Layout is written in "reference pixels" for a 1512 px wide client area and scale
 `client_width / 1512` clamped to 75–175 %, so the panel keeps the same proportions at any
 resolution or system scaling.
 
-**Numpad keys — `src/ChroniconMapReveal.cpp`.**
+**Keys and configuration — `src/hotkeys.cpp`.**
 
-A `WH_KEYBOARD_LL` hook runs on its own message-loop thread. It matches
-`KBDLLHOOKSTRUCT::scanCode` + the `LLKHF_EXTENDED` flag, which identifies the numpad digits
-whether NumLock is on or off (with NumLock off the same keys arrive as
-Insert/End/Down/PageDown but keep scan codes `0x52 / 0x4F / 0x50 / 0x51` and no extended flag).
-The hook only records "pressed" flags; the toggles are applied on the game thread from
+A `WH_KEYBOARD_LL` hook runs on its own message-loop thread and is matched against a small binding
+table. Numpad digit bindings are matched by `KBDLLHOOKSTRUCT::scanCode` (plus "no `LLKHF_EXTENDED`"),
+which identifies them whether NumLock is on or off (with NumLock off the same keys arrive as
+Insert/End/Down/PageDown but keep scan codes `0x47…0x53`); everything else is matched by virtual
+key, and modifier combinations (`CTRL+`, `ALT+`, `SHIFT+`, `WIN+`) must match exactly.
+
+The hook only records "pressed" flags. All state changes are applied on the game thread from
 `world_gen_step`, so the drawing-gate patch — which rewrites code bytes — is never applied while
-another thread could be executing that instruction. If `SetWindowsHookExW` fails, the mod falls
-back to polling `GetAsyncKeyState(VK_NUMPAD0..3)`, which needs NumLock on.
+another thread could be executing that instruction.
 
-## 7. Updating for a new game build
+Bindings live in `<mod folder>\ChroniconMapReveal.ini` (created on first run, UTF-8, hand-written
+parser in the same file — the Win32 profile API is avoided so comments survive round-trips).
+The game thread polls the file's content hash every ~2 s and reloads on change (a timestamp check
+is unreliable: two writes inside one system clock tick can share a timestamp). Rebinding writes
+the file back, so a hand edit and an in-game rebind cannot get out of sync.
+
+Rebind mode is a thin state machine in `ChroniconMapReveal.cpp`: the rebind key tells the hook to
+capture the next key press (`CaptureNextKey`), the captured `KeySpec` is handed back to the game
+thread, which validates it against the other actions and calls `SetBinding`.
+
+## 8. Updating for a new game build
 
 1. Get the new `Chronicon.exe` SHA256 and open an issue.
 2. Re-locate the scripts (name → address mapping, section 2) and refresh the `RVA_*` constants
    and `PROLOGUE_*` byte patterns in `src/ChroniconMapReveal.cpp`.
 3. Re-check the drawing-gate instruction in `minimapRefresh` (`DRAW_GATE_ORIGINAL`) — it is a
    6-byte `je rel32`; only its existence and target semantics need to hold.
-4. Rebuild and re-test with `F6` / `Numpad 3` status output and `aurie.log`.
+4. Rebuild and re-test with the status key (`Numpad 3` by default) and `aurie.log`; the
+   `minimapSetArea` call rate in the log tells you whether the zone-entry pulse still lines up.

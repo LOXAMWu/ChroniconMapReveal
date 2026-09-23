@@ -12,4 +12,9 @@ namespace mr_overlay
 
 	// 显示 / 隐藏面板 (热键调用, 可在任意线程)。
 	void ToggleVisible();
+	void SetVisible(bool visible);
+
+	// 面板上的文字 (可在任意线程调用)
+	void SetRowKey(int row, const wchar_t* key_text);	// row: 0 = 机制 A, 1 = 机制 B
+	void SetBottomLine(const wchar_t* text);
 }

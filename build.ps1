@@ -64,7 +64,7 @@ $includeAurie = Join-Path $PSScriptRoot 'third_party\aurie'
 $includeMinHook = Join-Path $PSScriptRoot 'third_party\minhook\include'
 $minhookSrc = Join-Path $PSScriptRoot 'third_party\minhook\src'
 $sourceDir = Join-Path $PSScriptRoot 'src'
-$sources = @('ChroniconMapReveal.cpp', 'overlay.cpp')
+$sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter '*.cpp' | Sort-Object Name | ForEach-Object { $_.Name })
 
 $objDir = Join-Path $OutDir 'obj'
 New-Item -ItemType Directory -Force -Path $objDir | Out-Null
